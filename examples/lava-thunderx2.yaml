@@ -1,8 +1,11 @@
-# Boot a ThunderX2 (AMI MegaRAC BMC, no usable network bootloader) off a GRUB
-# EFI fetched by URL. LAVA downloads the EFI, a postprocess container wraps it
-# in an ISO and attaches it to the BMC as an NFS virtual CD, then the device's
-# own power commands select the CD and power the board on. Nothing on the disk
-# is used and nothing is pre-staged on the worker.
+# Boot a ThunderX2 (AMI MegaRAC BMC, no usable network bootloader) off the
+# prebuilt GRUB ISO in this repo. LAVA downloads the ISO into the flasher
+# directory - which lives in the NFS-exported dispatcher tree - and the device
+# dictionary's flasher commands attach it to that board's BMC. Because the BMC
+# address comes from the device dictionary, this job works unchanged on every
+# board of the device type. The device's power commands then select the virtual
+# CD, and LAVA interrupts GRUB on the serial console to netboot the kernel and
+# ramdisk over TFTP. Nothing on the disk is used.
 device_type: thunderx2
 job_name: thunderx2 netboot via megarac-boot-iso
 visibility: public
@@ -16,29 +19,17 @@ timeouts:
 
 actions:
 - deploy:
-    to: downloads
+    timeout:
+      minutes: 10
+    to: flasher
     images:
-      grub:
-        # The standalone GRUB shipped in this repo: it has the serial console +
-        # menu embedded, so it drives serial and is interruptible. A distro
-        # grubaa64.efi will NOT work here - it ignores the ISO's grub.cfg and
-        # drops to the grub> shell on video with no serial. See grub/README.
-        url: https://raw.githubusercontent.com/mattface/megarac-boot-iso/main/grub/grubaa64.efi
-    postprocess:
-      docker:
-        image: debian:stable-slim
-        steps:
-        - apt-get update && apt-get install -y mtools xorriso curl ca-certificates >/dev/null
-        - curl -fsSL -o megarac-boot-iso https://raw.githubusercontent.com/mattface/megarac-boot-iso/main/megarac-boot-iso
-        - chmod +x megarac-boot-iso
-        # Everything is inferred: NFS server/path from LAVA_DISPATCHER_IP,
-        # LAVA_JOB_ID and LAVA_DISPATCHER_PREFIX; the BMC from the device's
-        # dynamic_data ($BMC_HOST); credentials default to admin/admin; the EFI
-        # is the single *.efi just downloaded; the image name defaults.
-        - ./megarac-boot-iso
+      iso:
+        url: https://raw.githubusercontent.com/mattface/megarac-boot-iso/main/grub/lava-grub.iso
 
 # The kernel and ramdisk that actually vary per job: ordinary tftp artifacts.
 - deploy:
+    timeout:
+      minutes: 10
     to: tftp
     kernel:
       url: https://deb.debian.org/debian/dists/bookworm/main/installer-arm64/current/images/netboot/debian-installer/arm64/linux
@@ -49,12 +40,16 @@ actions:
     os: oe
 
 - boot:
+    timeout:
+      minutes: 15
     method: grub
     commands: ramdisk
     prompts:
     - '/ #'
 
 - test:
+    timeout:
+      minutes: 5
     definitions:
     - repository:
         metadata:
