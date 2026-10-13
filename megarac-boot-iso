@@ -1,0 +1,238 @@
+#!/bin/bash
+# megarac-boot-iso - wrap an EFI binary in a bootable ISO and serve it to an
+# AMI MegaRAC BMC as an NFS-backed virtual CD.
+#
+# The BMC mounts the ISO over NFS and presents it to the host as a virtual
+# CD-ROM, so a server whose firmware has no usable network bootloader can still
+# be made to boot an arbitrary aarch64 (or x86) EFI binary. Powering the host on
+# and selecting the CD as the boot device is left to the caller (IPMI
+# `chassis bootdev cdrom options=efiboot` + power on, or the BMC UI).
+#
+# Typical use is from a CI step that already has the EFI binary and a directory
+# that an NFS server exports. Under LAVA's `deploy: to: downloads` postprocess
+# the NFS server address and export path are discovered automatically from the
+# environment LAVA provides (see --nfs-server / --nfs-path below).
+#
+# Dependencies: bash, curl, mtools (mformat/mmd/mcopy), xorriso, coreutils.
+#
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+
+# BMC_HOST / BMC_USER / BMC_PASS may be supplied in the environment (e.g. from a
+# LAVA device's dynamic_data, which the downloads postprocess exports) and are
+# overridden by the matching flags. Credentials default to admin/admin.
+BMC_HOST="${BMC_HOST:-}"
+BMC_USER="${BMC_USER:-admin}"
+BMC_PASS="${BMC_PASS:-admin}"
+NFS_SERVER=""
+NFS_PATH=""
+OUT_DIR="."
+# --image-name / --efi may also come from the environment; --efi, if still unset,
+# auto-detects a single *.efi in the output directory (the download dir under
+# LAVA), so a postprocess step can be argument-free.
+IMAGE_NAME="${MEGARAC_IMAGE_NAME:-boot.iso}"
+EFI_FILE="${MEGARAC_EFI:-}"
+GRUB_CFG=""
+CONSOLE_SPEED="115200"
+VOLUME_ID="BOOTISO"
+SLACK_MIB="2"
+NAMESPACE="${LAVA_NAMESPACE:-common}"
+DISPATCHER_TMP="/var/lib/lava/dispatcher/tmp"
+
+usage() {
+    cat >&2 <<EOF
+usage: megarac-boot-iso --efi FILE --bmc-host HOST [options]
+
+Build a bootable ISO around an EFI binary and attach it to an AMI MegaRAC BMC
+as an NFS virtual CD.
+
+Required:
+  --efi FILE            EFI binary to boot (becomes EFI/BOOT/BOOTAA64.EFI). May
+                         be set via \$MEGARAC_EFI; if unset, a single *.efi in
+                         the output directory is used automatically.
+  --bmc-host HOST        BMC address (or set \$BMC_HOST in the environment)
+
+BMC credentials (default admin/admin, or \$BMC_USER / \$BMC_PASS):
+  --bmc-user USER
+  --bmc-pass PASS
+
+NFS share the BMC mounts (auto-detected under LAVA, see below):
+  --nfs-server IP        address the BMC mounts from
+  --nfs-path PATH        host path of the directory the ISO is written into
+  --out-dir DIR          where to write the ISO (default: .); must be the same
+                         directory, on the host, that --nfs-path names
+  --image-name NAME      ISO filename (default: boot.iso, or \$MEGARAC_IMAGE_NAME)
+
+ISO options:
+  --grub-cfg FILE        use this grub.cfg instead of the built-in menu. By
+                         default a small menu with a serial console and a 10s
+                         timeout is embedded so the harness can interrupt GRUB.
+                         Written to both /boot/grub/grub.cfg and
+                         /EFI/BOOT/grub.cfg (where a CD-loaded GRUB looks).
+  --console-speed BAUD   serial speed for the built-in menu (default: 115200)
+  --volume-id ID         ISO/FAT volume label (default: BOOTISO)
+  --slack-mib N          spare space in the FAT image, MiB (default: 2)
+
+LAVA auto-detection:
+  With no --nfs-server, \$LAVA_DISPATCHER_IP is used.
+  With no --nfs-path, the path is reconstructed as
+    \$DISPATCHER_TMP/\${LAVA_DISPATCHER_PREFIX}\${LAVA_JOB_ID}/downloads/\$NAMESPACE
+  (DISPATCHER_TMP defaults to $DISPATCHER_TMP, NAMESPACE to \$LAVA_NAMESPACE or
+  "common"). Pass --nfs-path explicitly if the job uses a non-default namespace.
+EOF
+    exit "${1:-2}"
+}
+
+log() { echo "megarac-boot-iso: $*"; }
+die() { echo "megarac-boot-iso: error: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --efi)         EFI_FILE="$2"; shift 2 ;;
+        --bmc-host)    BMC_HOST="$2"; shift 2 ;;
+        --bmc-user)    BMC_USER="$2"; shift 2 ;;
+        --bmc-pass)    BMC_PASS="$2"; shift 2 ;;
+        --nfs-server)  NFS_SERVER="$2"; shift 2 ;;
+        --nfs-path)    NFS_PATH="$2"; shift 2 ;;
+        --out-dir)     OUT_DIR="$2"; shift 2 ;;
+        --image-name)  IMAGE_NAME="$2"; shift 2 ;;
+        --grub-cfg)    GRUB_CFG="$2"; shift 2 ;;
+        --console-speed) CONSOLE_SPEED="$2"; shift 2 ;;
+        --volume-id)   VOLUME_ID="$2"; shift 2 ;;
+        --slack-mib)   SLACK_MIB="$2"; shift 2 ;;
+        --namespace)   NAMESPACE="$2"; shift 2 ;;
+        -h|--help)     usage 0 ;;
+        *)             echo "unknown argument: $1" >&2; usage ;;
+    esac
+done
+
+# --- resolve the NFS share (explicit flags win, else LAVA environment) -------
+if [ -z "$NFS_SERVER" ]; then
+    NFS_SERVER="${LAVA_DISPATCHER_IP:-}"
+fi
+if [ -z "$NFS_PATH" ] && [ -n "${LAVA_JOB_ID:-}" ]; then
+    NFS_PATH="${DISPATCHER_TMP}/${LAVA_DISPATCHER_PREFIX:-}${LAVA_JOB_ID}/downloads/${NAMESPACE}"
+fi
+
+# If no EFI was given, auto-detect a single *.efi in the output directory.
+if [ -z "$EFI_FILE" ]; then
+    shopt -s nullglob nocaseglob
+    efis=("$OUT_DIR"/*.efi)
+    shopt -u nullglob nocaseglob
+    case "${#efis[@]}" in
+        1) EFI_FILE="${efis[0]}" ;;
+        0) die "no --efi, no \$MEGARAC_EFI, and no *.efi found in $OUT_DIR" ;;
+        *) die "no --efi given and several *.efi in $OUT_DIR (${efis[*]}); set --efi or \$MEGARAC_EFI" ;;
+    esac
+fi
+
+[ -n "$EFI_FILE" ]   || die "--efi is required"
+[ -f "$EFI_FILE" ]   || die "EFI file not found: $EFI_FILE"
+[ -n "$BMC_HOST" ]   || die "--bmc-host is required"
+[ -n "$NFS_SERVER" ] || die "no --nfs-server and \$LAVA_DISPATCHER_IP is unset"
+[ -n "$NFS_PATH" ]   || die "no --nfs-path and it could not be derived from the environment"
+
+for tool in curl mformat mmd mcopy xorriso; do
+    command -v "$tool" >/dev/null 2>&1 || die "missing dependency: $tool"
+done
+
+mkdir -p "$OUT_DIR"
+ISO_PATH="$OUT_DIR/$IMAGE_NAME"
+
+# --- build the bootable ISO --------------------------------------------------
+# The El Torito EFI boot image must itself be a FAT filesystem (UEFI spec); a
+# raw PE binary is rejected by strict firmware. Build a FAT16 image (mformat
+# -c 4 keeps the cluster count in FAT16 range for images of this size, which
+# AMI Aptio firmware boots - FAT12/FAT32 at this size can be refused), holding
+# EFI/BOOT/BOOTAA64.EFI, then reference it as the El Torito boot image.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+EFI_BYTES="$(stat -c%s "$EFI_FILE")"
+IMG_KIB=$(( (EFI_BYTES / 1024) + SLACK_MIB * 1024 ))
+IMG_KIB=$(( ((IMG_KIB + 1023) / 1024) * 1024 ))     # round up to a whole MiB
+
+# A GRUB loaded as EFI/BOOT/BOOTAA64.EFI needs a config to present a menu. Use
+# the caller's if given, otherwise embed a small one: a serial console and a
+# 10s timeout so the test harness can interrupt the menu and drop to the GRUB
+# command line. If nobody interrupts, it returns to firmware (normal boot order).
+if [ -z "$GRUB_CFG" ]; then
+    GRUB_CFG="$WORK/grub.cfg"
+    cat > "$GRUB_CFG" <<EOF
+serial --speed=${CONSOLE_SPEED} efi0
+terminal_input console serial
+terminal_output console serial
+set timeout=10
+menuentry "megarac-boot-iso: waiting for the test harness (exit to firmware)" {
+    echo "Menu was not interrupted; returning to firmware."
+    exit
+}
+EOF
+else
+    [ -f "$GRUB_CFG" ] || die "grub.cfg not found: $GRUB_CFG"
+fi
+
+mkdir -p "$WORK/iso"
+dd if=/dev/zero of="$WORK/iso/efiboot.img" bs=1024 count="$IMG_KIB" status=none
+mformat -i "$WORK/iso/efiboot.img" -c 4 -v "$VOLUME_ID" ::
+mmd -i "$WORK/iso/efiboot.img" ::/EFI ::/EFI/BOOT ::/boot ::/boot/grub
+mcopy -i "$WORK/iso/efiboot.img" "$EFI_FILE" ::/EFI/BOOT/BOOTAA64.EFI
+# Place the config where a CD-loaded GRUB looks: next to the binary, and the
+# conventional /boot/grub. Also drop it in the ISO9660 tree for good measure.
+mcopy -i "$WORK/iso/efiboot.img" "$GRUB_CFG" ::/boot/grub/grub.cfg
+mcopy -i "$WORK/iso/efiboot.img" "$GRUB_CFG" ::/EFI/BOOT/grub.cfg
+mkdir -p "$WORK/iso/boot/grub" "$WORK/iso/EFI/BOOT"
+cp "$GRUB_CFG" "$WORK/iso/boot/grub/grub.cfg"
+cp "$GRUB_CFG" "$WORK/iso/EFI/BOOT/grub.cfg"
+
+xorriso -as mkisofs -R -J -V "$VOLUME_ID" \
+    -e efiboot.img -no-emul-boot \
+    -o "$WORK/$IMAGE_NAME" "$WORK/iso" >/dev/null 2>&1
+
+# Install atomically so the BMC never reads a half-written ISO.
+cp "$WORK/$IMAGE_NAME" "$OUT_DIR/.$IMAGE_NAME.tmp"
+mv "$OUT_DIR/.$IMAGE_NAME.tmp" "$ISO_PATH"
+log "built $ISO_PATH ($(stat -c%s "$ISO_PATH") bytes) from $EFI_FILE"
+
+# --- attach it to the BMC as an NFS virtual CD -------------------------------
+B="https://${BMC_HOST}"
+CJ="$WORK/cj"
+CURL=(curl -sk --max-time 30)
+
+resp="$("${CURL[@]}" -c "$CJ" -X POST "$B/api/session" \
+    --data-urlencode "username=${BMC_USER}" \
+    --data-urlencode "password=${BMC_PASS}")"
+TOKEN="$(printf '%s' "$resp" | sed -n 's/.*"CSRFToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+[ -n "$TOKEN" ] || die "BMC login failed (no CSRFToken in response)"
+auth=(-b "$CJ" -H "X-CSRFTOKEN: $TOKEN")
+logout() { "${CURL[@]}" "${auth[@]}" -X DELETE "$B/api/session" >/dev/null 2>&1 || true; }
+trap 'logout; rm -rf "$WORK"' EXIT
+
+# Stop any existing CD redirection before re-pointing the share (ignore errors).
+"${CURL[@]}" "${auth[@]}" -X POST "$B/api/settings/media/remote/stop-media" \
+    -H 'Content-Type: application/json' \
+    -d '{"image_type":1,"image_index":0}' >/dev/null 2>&1 || true
+
+# Point the general media config at our NFS share as the CD source.
+"${CURL[@]}" "${auth[@]}" -X PUT "$B/api/settings/media/general" \
+    -H 'Content-Type: application/json' -d @- >/dev/null <<JSON
+{
+  "id": 1, "local_media_support": 0, "remote_media_support": 1, "same_settings": 0,
+  "cd_remote_server_address": "${NFS_SERVER}", "cd_remote_source_path": "${NFS_PATH}",
+  "cd_remote_share_type": "nfs", "cd_remote_domain_name": "", "cd_remote_user_name": "",
+  "mount_cd": 1, "mount_fd": 0,
+  "fd_remote_server_address": "", "fd_remote_source_path": "", "fd_remote_share_type": "",
+  "fd_remote_domain_name": "", "fd_remote_user_name": "",
+  "mount_hd": 0, "hd_remote_server_address": "", "hd_remote_source_path": "",
+  "hd_remote_share_type": "", "hd_remote_domain_name": "", "hd_remote_user_name": ""
+}
+JSON
+
+# Start redirection of our ISO as the virtual CD.
+"${CURL[@]}" "${auth[@]}" -X POST "$B/api/settings/media/remote/start-media" \
+    -H 'Content-Type: application/json' \
+    -d "{\"image_name\":\"${IMAGE_NAME}\",\"image_type\":1,\"image_index\":0}" >/dev/null \
+    || die "BMC start-media failed"
+
+log "BMC ${BMC_HOST} redirecting nfs://${NFS_SERVER}${NFS_PATH}/${IMAGE_NAME} as virtual CD"
