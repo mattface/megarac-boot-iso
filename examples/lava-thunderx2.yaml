@@ -19,8 +19,11 @@ actions:
     to: downloads
     images:
       grub:
-        # Any aarch64 GRUB EFI. Debian's installer grub is a convenient one.
-        url: https://ftp.debian.org/debian/dists/stable/main/installer-arm64/current/images/netboot/debian-installer/arm64/grubaa64.efi
+        # The standalone GRUB shipped in this repo: it has the serial console +
+        # menu embedded, so it drives serial and is interruptible. A distro
+        # grubaa64.efi will NOT work here - it ignores the ISO's grub.cfg and
+        # drops to the grub> shell on video with no serial. See grub/README.
+        url: https://raw.githubusercontent.com/mattface/megarac-boot-iso/main/grub/grubaa64.efi
     postprocess:
       docker:
         image: debian:stable-slim

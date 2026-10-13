@@ -49,15 +49,28 @@ Credentials default to `admin`/`admin`; override with `--bmc-user`/`--bmc-pass`.
 host, that `--nfs-path` names (they differ only when the writer sees it through
 a bind mount — see LAVA below). Run `megarac-boot-iso --help` for all options.
 
-### GRUB menu
+### GRUB must carry its own serial config — use the bundled one
 
-A GRUB loaded from CD needs a config to show a menu. By default the tool embeds
-a small one — a serial console and a 10-second timeout — so the test harness
-can interrupt the menu and drop to the GRUB command line; if nobody interrupts,
-it returns to firmware. Set the serial speed with `--console-speed`. The config
-is written to `/boot/grub/grub.cfg` and `/EFI/BOOT/grub.cfg` (where a CD-loaded
-GRUB looks). Pass `--grub-cfg FILE` to supply your own instead. A GRUB built as
-a standalone binary with its config already embedded ignores these.
+Use a **standalone** GRUB with the serial console baked into its own `(memdisk)`.
+This repo ships one at [`grub/grubaa64.efi`](grub/grubaa64.efi) (built by
+[`grub/build.sh`](grub/build.sh) from [`grub/grub.cfg`](grub/grub.cfg)); point
+the job's download at its raw URL.
+
+A **distro** `grubaa64.efi` (e.g. Debian's netboot one) does **not** work: its
+prefix is a baked-in `(memdisk)`, so it ignores a `grub.cfg` placed on the ISO,
+drops to the `grub>` shell on the *video* console, and never enables serial —
+the harness sees nothing. Confirmed on the ThunderX2/AMI board this targets.
+
+When wrapping an EFI that is *not* a standalone GRUB, the tool still writes a
+small menu config to `/boot/grub/grub.cfg` and `/EFI/BOOT/grub.cfg` (serial
+console, 10s timeout; `--console-speed` sets the baud, `--grub-cfg FILE`
+overrides it) — but only a GRUB whose prefix points there will read it.
+
+> **Board note:** the OS console (`console=ttyAMA0`) reaches the BMC's
+> serial-over-LAN on its own, but GRUB cannot drive that UART on this board (no
+> EFI Serial I/O Protocol, no PL011 driver in arm64-efi GRUB), so GRUB reaches
+> SOL only via the firmware console. The firmware's BIOS **Console Redirection**
+> must be **enabled** for the harness to interrupt GRUB over serial.
 
 ## Use under LAVA
 
