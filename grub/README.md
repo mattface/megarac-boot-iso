@@ -4,7 +4,7 @@
   `grubaa64.efi`; point a `deploy: to: flasher` image at its raw URL and let
   `megarac-boot-iso --iso` attach it. No build tools needed at run time.
 - **`grubaa64.efi`** — a standalone arm64 GRUB with [`grub.cfg`](grub.cfg)
-  embedded in its `(memdisk)`, so the console and a 10-second interruptible menu
+  embedded in its `(memdisk)`, so the console and a 30-second interruptible menu
   always run wherever it is loaded from.
 
 Rebuild both with [`build.sh`](build.sh). It needs `grub-mkstandalone` for the

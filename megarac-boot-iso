@@ -158,13 +158,13 @@ if [ -z "$ISO_FILE" ]; then
     done
 
     # A GRUB loaded from CD needs a config to present a menu. Use the caller's if
-    # given, otherwise embed a small one: a 10s timeout so the test harness can
+    # given, otherwise embed a small one: a 30s timeout so the test harness can
     # interrupt the menu and drop to the GRUB command line. If nobody
     # interrupts, it returns to firmware (normal boot order).
     if [ -z "$GRUB_CFG" ]; then
         GRUB_CFG="$WORK/grub.cfg"
         cat > "$GRUB_CFG" <<EOF
-set timeout=10
+set timeout=30
 terminal_input console
 terminal_output console
 menuentry "megarac-boot-iso: waiting for the test harness (exit to firmware)" {
@@ -177,16 +177,23 @@ EOF
     fi
 
     # The El Torito EFI boot image must itself be a FAT filesystem (UEFI spec); a
-    # raw PE binary is rejected by strict firmware. Build a FAT16 image (mformat
-    # -c 4 keeps the cluster count in FAT16 range for images of this size, which
-    # AMI Aptio firmware boots - FAT12/FAT32 at this size can be refused).
+    # raw PE binary is rejected by strict firmware. It must be FAT16: AMI Aptio
+    # firmware boots that, and can refuse FAT12/FAT32. With 2 sectors/cluster the
+    # cluster count stays in FAT16 range (4085..65524) for images from ~4MiB to
+    # ~64MiB, which covers any realistic GRUB; the check below enforces it, since
+    # mtools silently picks FAT12 for a small image and FAT32 for a large one.
     EFI_BYTES="$(stat -c%s "$EFI_FILE")"
     IMG_KIB=$(( (EFI_BYTES / 1024) + SLACK_MIB * 1024 ))
     IMG_KIB=$(( ((IMG_KIB + 1023) / 1024) * 1024 ))     # round up to a whole MiB
 
     mkdir -p "$WORK/iso"
     dd if=/dev/zero of="$WORK/iso/efiboot.img" bs=1024 count="$IMG_KIB" status=none
-    mformat -i "$WORK/iso/efiboot.img" -c 4 -v "$VOLUME_ID" ::
+    mformat -i "$WORK/iso/efiboot.img" -c 2 -v "$VOLUME_ID" ::
+    fat_type="$(dd if="$WORK/iso/efiboot.img" bs=1 skip=54 count=8 2>/dev/null)"
+    case "$fat_type" in
+        FAT16*) ;;
+        *) die "built a ${fat_type% *} boot image, need FAT16 (adjust --slack-mib)" ;;
+    esac
     mmd -i "$WORK/iso/efiboot.img" ::/EFI ::/EFI/BOOT ::/boot ::/boot/grub
     mcopy -i "$WORK/iso/efiboot.img" "$EFI_FILE" ::/EFI/BOOT/BOOTAA64.EFI
     # Place the config where a CD-loaded GRUB looks: next to the binary, and the
