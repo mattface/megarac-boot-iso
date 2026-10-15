@@ -41,6 +41,7 @@ GRUB_CFG=""
 VOLUME_ID="BOOTISO"
 SLACK_MIB="2"
 BUILD_ONLY=0
+WAIT_READY=0
 NAMESPACE="${LAVA_NAMESPACE:-common}"
 DISPATCHER_TMP="${DISPATCHER_TMP:-/var/lib/lava/dispatcher/tmp}"
 LAVA_DOWNLOADS_MOUNT="/lava-downloads"
@@ -66,6 +67,8 @@ BMC (not needed with --build-only):
   --bmc-host HOST        BMC address (or \$BMC_HOST)
   --bmc-user USER        default admin (or \$BMC_USER)
   --bmc-pass PASS        default admin (or \$BMC_PASS)
+  --wait-ready SECONDS   keep retrying the login for this long before giving up,
+                         for a BMC that is still coming up (default 0, one try)
 
 NFS share the BMC mounts:
   --nfs-server IP        address the BMC mounts from (or \$LAVA_DISPATCHER_IP)
@@ -97,6 +100,7 @@ while [ $# -gt 0 ]; do
         --bmc-host)      BMC_HOST="$2"; shift 2 ;;
         --bmc-user)      BMC_USER="$2"; shift 2 ;;
         --bmc-pass)      BMC_PASS="$2"; shift 2 ;;
+        --wait-ready)    WAIT_READY="$2"; shift 2 ;;
         --nfs-server)    NFS_SERVER="$2"; shift 2 ;;
         --nfs-path)      NFS_PATH="$2"; shift 2 ;;
         --out-dir)       OUT_DIR="$2"; shift 2 ;;
@@ -230,11 +234,23 @@ B="https://${BMC_HOST}"
 CJ="$WORK/cj"
 CURL=(curl -sk --max-time 30)
 
-resp="$("${CURL[@]}" -c "$CJ" -X POST "$B/api/session" \
-    --data-urlencode "username=${BMC_USER}" \
-    --data-urlencode "password=${BMC_PASS}")"
-TOKEN="$(printf '%s' "$resp" | sed -n 's/.*"CSRFToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-[ -n "$TOKEN" ] || die "BMC login failed (no CSRFToken in response)"
+# A BMC that has just had its power restored answers pings, and even serves the
+# web UI, well before its session backend will grant a login, so --wait-ready
+# retries rather than failing the deploy on a BMC that is merely still booting.
+bmc_login() {
+    resp="$("${CURL[@]}" -c "$CJ" -X POST "$B/api/session" \
+        --data-urlencode "username=${BMC_USER}" \
+        --data-urlencode "password=${BMC_PASS}" 2>/dev/null || true)"
+    TOKEN="$(printf '%s' "$resp" | sed -n 's/.*"CSRFToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    [ -n "$TOKEN" ]
+}
+
+deadline=$(( $(date +%s) + WAIT_READY ))
+until bmc_login; do
+    [ "$(date +%s)" -lt "$deadline" ] || die "BMC login failed (no CSRFToken in response)"
+    log "BMC not ready, retrying login"
+    sleep 5
+done
 auth=(-b "$CJ" -H "X-CSRFTOKEN: $TOKEN")
 logout() { "${CURL[@]}" "${auth[@]}" -X DELETE "$B/api/session" >/dev/null 2>&1 || true; }
 trap 'logout; rm -rf "$WORK"' EXIT
